@@ -1,0 +1,79 @@
+[
+  {
+    "Date": "27SEP24 01OCT24",
+    "Details": "Balance from last stmt Interest Rate 0.0100% Interest Rate 0.0100% Interest Rate 0.0100% Credit Interest DIRT at 33pc 3.43 Interest Rate 0.0100% Interest Rate 0.0100% Interest Rate 0.0100% Interest Rate 0.0100%",
+    "Withdrawn": "",
+    "Paid In": "6.97",
+    "Balance": "104006.48 104013.45"
+  },
+  {
+    "Date": "01NOV24 20NOV24 01DEC24 01JAN25 01FEB25 01MAR25 01APR25",
+    "Details": "",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "01MAY25",
+    "Details": "",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "",
+    "Details": "Interest Rate 0.0100%",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "01JUN25",
+    "Details": "Interest Rate 0.0100%",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "01JUL25",
+    "Details": "",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "",
+    "Details": "Interest Rate 0.0100%",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "01AUG25",
+    "Details": "Interest Rate 0.0100%",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "01SEP25 27SEP24",
+    "Details": "Interest Rate 0.0100% RATES APPLIED INPERIOD Rate applied 0.0100%",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  },
+  {
+    "Date": "",
+    "Details": "Closing Balance",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": "104013.45"
+  },
+  {
+    "Date": "2",
+    "Details": "",
+    "Withdrawn": "",
+    "Paid In": "",
+    "Balance": ""
+  }
+]

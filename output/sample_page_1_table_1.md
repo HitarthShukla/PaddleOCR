@@ -1,0 +1,13 @@
+| Date | Details | Withdrawn | Paid In | Balance |
+| --- | --- | --- | --- | --- |
+| 27SEP24 01OCT24 | Balance from last stmt Interest Rate 0.0100% Interest Rate 0.0100% Interest Rate 0.0100% Credit Interest DIRT at 33pc 3.43 Interest Rate 0.0100% Interest Rate 0.0100% Interest Rate 0.0100% Interest Rate 0.0100% |  | 6.97 | 104006.48 104013.45 |
+| 01NOV24 20NOV24 01DEC24 01JAN25 01FEB25 01MAR25 01APR25 |  |  |  |  |
+| 01MAY25 |  |  |  |  |
+|  | Interest Rate 0.0100% |  |  |  |
+| 01JUN25 | Interest Rate 0.0100% |  |  |  |
+| 01JUL25 |  |  |  |  |
+|  | Interest Rate 0.0100% |  |  |  |
+| 01AUG25 | Interest Rate 0.0100% |  |  |  |
+| 01SEP25 27SEP24 | Interest Rate 0.0100% RATES APPLIED INPERIOD Rate applied 0.0100% |  |  |  |
+|  | Closing Balance |  |  | 104013.45 |
+| 2 |  |  |  |  |
