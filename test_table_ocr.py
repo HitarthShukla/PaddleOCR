@@ -129,6 +129,307 @@ def center_of(box):
         (y1 + y2) / 2
     )
 
+def cluster_1d(values, k, max_iterations=50):
+    """
+    Simple 1D k-means clustering.
+    Returns clusters sorted by their center.
+    """
+    if not values:
+        return []
+
+    values = [float(v) for v in values]
+
+    if len(values) <= k:
+        return [
+            {
+                "center": v,
+                "values": [v]
+            }
+            for v in sorted(values)
+        ]
+
+    # Initial centers using evenly spaced values.
+    sorted_values = sorted(values)
+
+    centers = []
+    for i in range(k):
+        index = round(
+            i * (len(sorted_values) - 1) / (k - 1)
+        )
+        centers.append(sorted_values[index])
+
+    for _ in range(max_iterations):
+
+        clusters = [[] for _ in range(k)]
+
+        for value in values:
+
+            nearest = min(
+                range(k),
+                key=lambda i: abs(value - centers[i])
+            )
+
+            clusters[nearest].append(value)
+
+        new_centers = []
+
+        for i, cluster in enumerate(clusters):
+
+            if cluster:
+                new_centers.append(
+                    sum(cluster) / len(cluster)
+                )
+            else:
+                new_centers.append(centers[i])
+
+        if all(
+            abs(a - b) < 0.01
+            for a, b in zip(centers, new_centers)
+        ):
+            break
+
+        centers = new_centers
+
+    result = []
+
+    for center, cluster in zip(centers, clusters):
+
+        if cluster:
+            result.append({
+                "center": center,
+                "values": cluster
+            })
+
+    result.sort(
+        key=lambda x: x["center"]
+    )
+
+    return result
+
+
+def detect_column_centers(
+    cell_boxes,
+    column_count
+):
+    """
+    Determine actual visual column centers from Paddle's
+    detected cell boxes.
+
+    This ignores the number of HTML rows completely.
+    """
+
+    if not cell_boxes:
+        return []
+
+    centers = []
+
+    for box in cell_boxes:
+
+        cx, _ = center_of(box)
+
+        centers.append(cx)
+
+    clusters = cluster_1d(
+        centers,
+        column_count
+    )
+
+    return [
+        cluster["center"]
+        for cluster in clusters
+    ]
+
+
+def assign_items_to_columns(
+    items,
+    column_centers
+):
+    """
+    Assign OCR items to the nearest visual column.
+    """
+
+    columns = [
+        []
+        for _ in column_centers
+    ]
+
+    for item in items:
+
+        cx, _ = item["center"]
+
+        column_index = min(
+            range(len(column_centers)),
+            key=lambda i:
+                abs(cx - column_centers[i])
+        )
+
+        columns[column_index].append(item)
+
+    return columns
+
+
+def cluster_ocr_rows(
+    ocr_items,
+    row_tolerance=None
+):
+    """
+    Group OCR items into visual text rows based on Y center.
+
+    Unlike Paddle's HTML rows, these rows represent what is
+    actually visible on the page.
+    """
+
+    if not ocr_items:
+        return []
+
+    items = sorted(
+        ocr_items,
+        key=lambda x: (
+            x["center"][1],
+            x["center"][0]
+        )
+    )
+
+    if row_tolerance is None:
+
+        heights = []
+
+        for item in items:
+
+            x1, y1, x2, y2 = item["box"]
+
+            heights.append(
+                max(1.0, y2 - y1)
+            )
+
+        heights.sort()
+
+        median_height = heights[
+            len(heights) // 2
+        ]
+
+        # OCR text on the same visual line normally has
+        # very similar Y centers.
+        row_tolerance = max(
+            4.0,
+            median_height * 0.65
+        )
+
+    rows = []
+
+    for item in items:
+
+        _, cy = item["center"]
+
+        placed = False
+
+        for row in rows:
+
+            average_y = sum(
+                x["center"][1]
+                for x in row
+            ) / len(row)
+
+            if abs(cy - average_y) <= row_tolerance:
+
+                row.append(item)
+                placed = True
+                break
+
+        if not placed:
+
+            rows.append([item])
+
+    # Top -> bottom.
+    rows.sort(
+        key=lambda row:
+            sum(
+                x["center"][1]
+                for x in row
+            ) / len(row)
+    )
+
+    # Left -> right inside each row.
+    for row in rows:
+
+        row.sort(
+            key=lambda x:
+                x["center"][0]
+        )
+
+    return rows
+
+def build_grid_from_ocr(
+    cell_boxes,
+    ocr_items,
+    column_count
+):
+    """
+    Reconstruct a table directly from OCR geometry.
+
+    This is used when Paddle's HTML table structure is
+    clearly unreliable.
+    """
+
+    if not ocr_items:
+        return [], 0, 0
+
+    column_centers = detect_column_centers(
+        cell_boxes,
+        column_count
+    )
+
+    if len(column_centers) != column_count:
+
+        print(
+            "WARNING: Could not reliably detect "
+            "column centers."
+        )
+
+        return [], 0, len(ocr_items)
+
+    visual_rows = cluster_ocr_rows(
+        ocr_items
+    )
+
+    grid = []
+
+    assigned_count = 0
+
+    for row_items in visual_rows:
+
+        columns = assign_items_to_columns(
+            row_items,
+            column_centers
+        )
+
+        row = []
+
+        for column_items in columns:
+
+            text = cell_text(
+                column_items
+            )
+
+            row.append(text)
+
+            if column_items:
+                assigned_count += len(
+                    column_items
+                )
+
+        grid.append(row)
+
+    unmatched = (
+        len(ocr_items)
+        - assigned_count
+    )
+
+    return (
+        grid,
+        assigned_count,
+        unmatched
+    )
 
 def point_inside(point, box):
 
@@ -912,9 +1213,73 @@ def build_final_grid(
         for row in html_grid
     )
 
-    # --------------------------------------------------------
-    # Get box grid.
-    # --------------------------------------------------------
+    # ========================================================
+    # DETECT WHETHER PADDLE'S HTML STRUCTURE IS SUSPICIOUS
+    # ========================================================
+
+    # Estimate how many actual visual rows exist from OCR.
+    visual_rows = cluster_ocr_rows(
+        ocr_items
+    )
+
+    visual_row_count = len(
+        visual_rows
+    )
+
+    html_is_suspicious = False
+
+    if visual_row_count > 0:
+
+        # Example:
+        #
+        # Paddle HTML: 39 rows
+        # OCR visual rows: ~21
+        #
+        # That's clearly bogus.
+        if rows > visual_row_count * 1.35:
+
+            html_is_suspicious = True
+
+    # Also flag extremely large empty HTML grids.
+    if rows >= 30 and len(ocr_items) < rows * 1.5:
+
+        html_is_suspicious = True
+
+    # ========================================================
+    # OCR-DRIVEN FALLBACK
+    # ========================================================
+
+    if html_is_suspicious:
+
+        print(
+            "WARNING: Paddle HTML structure appears "
+            "over-expanded."
+        )
+
+        print(
+            f"Using OCR geometry reconstruction: "
+            f"{visual_row_count} visual rows"
+        )
+
+        grid, assigned, unmatched = (
+            build_grid_from_ocr(
+                cell_boxes,
+                ocr_items,
+                cols
+            )
+        )
+
+        if grid:
+
+            return (
+                grid,
+                assigned,
+                unmatched
+            )
+
+    # ========================================================
+    # NORMAL PADDLE HTML PATH
+    # ========================================================
 
     if len(cell_boxes) == rows * cols:
 
@@ -935,15 +1300,16 @@ def build_final_grid(
 
     if box_grid is None:
 
-        # No usable geometry.
-        # Fall back completely to HTML text.
         grid = []
 
         for row in html_grid:
 
             grid.append([
                 clean_text(
-                    cell.get("text", "")
+                    cell.get(
+                        "text",
+                        ""
+                    )
                 )
                 for cell in row
             ])
@@ -953,13 +1319,6 @@ def build_final_grid(
             0,
             len(ocr_items)
         )
-
-    # --------------------------------------------------------
-    # ONLY send valid boxes to OCR assignment.
-    #
-    # None entries are legitimate when HTML contains
-    # rowspan/colspan structure.
-    # --------------------------------------------------------
 
     valid_boxes = []
     valid_positions = []
@@ -978,20 +1337,12 @@ def build_final_grid(
                     (r, c)
                 )
 
-    # --------------------------------------------------------
-    # Assign OCR only to real detected cells.
-    # --------------------------------------------------------
-
     assigned, assigned_count, unmatched = (
         assign_ocr_to_cells(
             valid_boxes,
             ocr_items
         )
     )
-
-    # --------------------------------------------------------
-    # Build final rectangular grid.
-    # --------------------------------------------------------
 
     grid = [
         [
@@ -1005,10 +1356,6 @@ def build_final_grid(
         ]
         for r in range(rows)
     ]
-
-    # --------------------------------------------------------
-    # Put OCR text into corresponding cells.
-    # --------------------------------------------------------
 
     for i, (r, c) in enumerate(
         valid_positions
@@ -1027,7 +1374,6 @@ def build_final_grid(
         assigned_count,
         unmatched,
     )
-
 # ============================================================
 # HEADERS
 # ============================================================
@@ -1084,39 +1430,9 @@ def to_markdown(grid):
             for x in row[:column_count]
         ])
 
-    # --------------------------------------------------------
-    # COLUMN WIDTH
-    #
-    # Width is based on the longest WORD in each column,
-    # NOT the longest complete cell.
-    # --------------------------------------------------------
-
-    widths = []
-
-    for col in range(column_count):
-
-        longest_word = 3
-
-        for row in normalized:
-
-            text = row[col]
-
-            words = text.split()
-
-            for word in words:
-
-                longest_word = max(
-                    longest_word,
-                    len(word)
-                )
-
-        widths.append(
-            longest_word
-        )
-
-    # --------------------------------------------------------
-    # Escape Markdown.
-    # --------------------------------------------------------
+    # ========================================================
+    # ESCAPE MARKDOWN
+    # ========================================================
 
     def escape(text):
 
@@ -1127,9 +1443,40 @@ def to_markdown(grid):
             .replace("\n", " ")
         )
 
-    # --------------------------------------------------------
-    # Center every cell.
-    # --------------------------------------------------------
+    escaped_grid = [
+        [
+            escape(cell)
+            for cell in row
+        ]
+        for row in normalized
+    ]
+
+    # ========================================================
+    # CALCULATE REAL COLUMN WIDTH
+    #
+    # IMPORTANT:
+    # Use the COMPLETE cell contents.
+    # NOT the longest word.
+    # ========================================================
+
+    widths = []
+
+    for col in range(column_count):
+
+        width = 3
+
+        for row in escaped_grid:
+
+            width = max(
+                width,
+                len(row[col])
+            )
+
+        widths.append(width)
+
+    # ========================================================
+    # FORMAT ROW
+    # ========================================================
 
     def format_row(row):
 
@@ -1137,10 +1484,8 @@ def to_markdown(grid):
 
         for i, text in enumerate(row):
 
-            escaped = escape(text)
-
             cells.append(
-                escaped.center(
+                text.ljust(
                     widths[i]
                 )
             )
@@ -1151,12 +1496,16 @@ def to_markdown(grid):
             + " |"
         )
 
+    # ========================================================
+    # BUILD MARKDOWN
+    # ========================================================
+
     output = []
 
     # Header
     output.append(
         format_row(
-            normalized[0]
+            escaped_grid[0]
         )
     )
 
@@ -1171,7 +1520,7 @@ def to_markdown(grid):
     )
 
     # Data
-    for row in normalized[1:]:
+    for row in escaped_grid[1:]:
 
         output.append(
             format_row(row)
@@ -1312,7 +1661,7 @@ def process_table(
     )
 
     print(
-        f"HTML structure: "
+        f"Paddle HTML structure: "
         f"{html_rows} rows × "
         f"{html_cols} columns"
     )
@@ -1332,6 +1681,9 @@ def process_table(
 
     # --------------------------------------------------------
     # OCR
+    #
+    # IMPORTANT:
+    # This MUST happen before using ocr_items.
     # --------------------------------------------------------
 
     ocr_items = extract_table_ocr(
@@ -1341,6 +1693,21 @@ def process_table(
     print(
         f"OCR items: "
         f"{len(ocr_items)}"
+    )
+
+    # --------------------------------------------------------
+    # OCR VISUAL ROW COUNT
+    # --------------------------------------------------------
+
+    ocr_visual_rows = len(
+        cluster_ocr_rows(
+            ocr_items
+        )
+    )
+
+    print(
+        f"OCR visual rows: "
+        f"{ocr_visual_rows}"
     )
 
     # --------------------------------------------------------
@@ -1395,6 +1762,10 @@ def process_table(
     )
 
     print()
+
+    # --------------------------------------------------------
+    # MARKDOWN
+    # --------------------------------------------------------
 
     markdown = to_markdown(
         grid
