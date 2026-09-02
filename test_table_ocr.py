@@ -2,6 +2,7 @@ from pathlib import Path
 import csv
 import json
 import re
+import html
 from html.parser import HTMLParser
 
 from paddleocr import PPStructureV3
@@ -35,6 +36,13 @@ def clean_text(text):
 
     text = str(text)
 
+    # Remove HTML tags such as:
+    # <div ...>, <img ...>, </div>, etc.
+    text = re.sub(r"<[^>]+>", "", text)
+
+    # Decode HTML entities
+    text = html.unescape(text)
+
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
 
@@ -42,7 +50,6 @@ def clean_text(text):
     text = text.replace("\\@", "@")
 
     return text.strip()
-
 
 def normalize_for_compare(text):
     return re.sub(
@@ -209,35 +216,70 @@ def cluster_1d(values, k, max_iterations=50):
 
 def detect_column_centers(
     cell_boxes,
-    column_count
+    column_count,
+    ocr_items=None
 ):
     """
-    Determine actual visual column centers from Paddle's
-    detected cell boxes.
+    Determine visual column centers.
 
-    This ignores the number of HTML rows completely.
+    Prefer table-cell geometry when available.  With
+    use_wired_table_cells_trans_to_html=True, PP-StructureV3 can use
+    RT-DETR wired cell detection geometry directly, which is the
+    reliable source for this wired bank-statement layout.
+
+    OCR X geometry is only a fallback when no usable cell boxes exist.
     """
 
-    if not cell_boxes:
-        return []
+    if cell_boxes:
+        centers = [
+            center_of(box)[0]
+            for box in cell_boxes
+        ]
 
-    centers = []
+        if len(centers) >= column_count:
+            clusters = cluster_1d(
+                centers,
+                column_count
+            )
 
-    for box in cell_boxes:
+            if len(clusters) == column_count:
+                return [
+                    cluster["center"]
+                    for cluster in clusters
+                ]
 
-        cx, _ = center_of(box)
+    if ocr_items:
+        # Paddle's rec_boxes are text-line boxes.  Their left edge is
+        # much more stable than the box center for right-aligned
+        # numeric columns and long Details text.
+        centers = [
+            float(item["box"][0])
+            for item in ocr_items
+            if item.get("text")
+        ]
 
-        centers.append(cx)
+        if len(centers) >= column_count:
+            clusters = cluster_1d(
+                centers,
+                column_count
+            )
 
-    clusters = cluster_1d(
-        centers,
-        column_count
-    )
+            if len(clusters) == column_count:
+                return [
+                    cluster["center"]
+                    for cluster in clusters
+                ]
 
-    return [
-        cluster["center"]
-        for cluster in clusters
-    ]
+    return []
+
+def _is_standalone_amount(text):
+    """Return True only for an OCR item that is just a monetary amount."""
+    text = clean_text(text)
+    return bool(re.fullmatch(
+        r"[€£$]?\s*\d+(?:,\d{3})*(?:\.\d{2})",
+        text
+    ))
+
 
 
 def assign_items_to_columns(
@@ -273,10 +315,17 @@ def cluster_ocr_rows(
     row_tolerance=None
 ):
     """
-    Group OCR items into visual text rows based on Y center.
+    Group OCR items into visual rows using OCR box CENTER-Y only.
 
-    Unlike Paddle's HTML rows, these rows represent what is
-    actually visible on the page.
+    For bank statements, adjacent rows are tightly packed but their
+    text centers are still separated.  Using box overlap as a row
+    criterion is dangerous because OCR boxes can be taller than the
+    visible glyphs and overlap the next physical row.  That was the
+    source of values such as two consecutive balances ending up in
+    one cell.
+
+    This function deliberately treats Y-center as the row signal and
+    never lets a tall OCR box "pull" the next row into the current one.
     """
 
     if not ocr_items:
@@ -291,73 +340,501 @@ def cluster_ocr_rows(
     )
 
     if row_tolerance is None:
+        heights = sorted(
+            max(1.0, x["box"][3] - x["box"][1])
+            for x in items
+        )
+        median_height = heights[len(heights) // 2]
 
-        heights = []
-
-        for item in items:
-
-            x1, y1, x2, y2 = item["box"]
-
-            heights.append(
-                max(1.0, y2 - y1)
-            )
-
-        heights.sort()
-
-        median_height = heights[
-            len(heights) // 2
-        ]
-
-        # OCR text on the same visual line normally has
-        # very similar Y centers.
+        # OCR boxes on one printed line normally have nearly identical
+        # center-Y values.  Adjacent bank-statement lines are farther
+        # apart.  Keep this deliberately below the line pitch.
         row_tolerance = max(
-            4.0,
-            median_height * 0.65
+            2.5,
+            median_height * 0.50
         )
 
     rows = []
+    current = [items[0]]
+    current_center = items[0]["center"][1]
 
-    for item in items:
+    for item in items[1:]:
+        cy = item["center"][1]
 
-        _, cy = item["center"]
+        # Compare against the current row center only.
+        # IMPORTANT: no vertical-overlap test here.
+        if abs(cy - current_center) <= row_tolerance:
+            current.append(item)
 
-        placed = False
+            # Robust center update: median is less likely than an average
+            # to drift when one OCR box is slightly mislocalized.
+            ys = sorted(x["center"][1] for x in current)
+            current_center = ys[len(ys) // 2]
+        else:
+            current.sort(key=lambda x: x["center"][0])
+            rows.append(current)
+            current = [item]
+            current_center = cy
 
-        for row in rows:
-
-            average_y = sum(
-                x["center"][1]
-                for x in row
-            ) / len(row)
-
-            if abs(cy - average_y) <= row_tolerance:
-
-                row.append(item)
-                placed = True
-                break
-
-        if not placed:
-
-            rows.append([item])
-
-    # Top -> bottom.
-    rows.sort(
-        key=lambda row:
-            sum(
-                x["center"][1]
-                for x in row
-            ) / len(row)
-    )
-
-    # Left -> right inside each row.
-    for row in rows:
-
-        row.sort(
-            key=lambda x:
-                x["center"][0]
-        )
+    current.sort(key=lambda x: x["center"][0])
+    rows.append(current)
 
     return rows
+
+
+def looks_like_bank_statement(html_grid, ocr_items=None):
+    """Robust bank-transaction detector; HTML header need not be first row."""
+    if not html_grid:
+        return False
+
+    if _is_bank_statement_summary(html_grid):
+        return False
+
+    text = " ".join(
+        clean_text(cell.get("text", ""))
+        for row in html_grid
+        for cell in row
+    ).lower()
+    normalized = normalize_for_compare(text)
+
+    html_ok = (
+        "date" in normalized
+        and ("details" in normalized or "description" in normalized)
+        and "balance" in normalized
+        and ("withdrawn" in normalized or "moneyout" in normalized)
+        and ("paidin" in normalized or "moneyin" in normalized)
+    )
+    if html_ok:
+        return True
+
+    if ocr_items:
+        ocr_text = " ".join(clean_text(x.get("text", "")) for x in ocr_items).lower()
+        on = normalize_for_compare(ocr_text)
+        return (
+            "date" in on
+            and "balance" in on
+            and ("withdrawn" in on or "moneyout" in on)
+            and ("paidin" in on or "moneyin" in on)
+        )
+    return False
+
+
+def _normalize_header_token(text):
+    return normalize_for_compare(text)
+
+
+def _is_bank_date(text):
+    """
+    Permanent TSB transaction dates in these PDFs are OCR'd as e.g. 03JUN25.
+    Keep this deliberately narrow so detail text containing dates is not
+    mistaken for the Date column.
+    """
+    text = clean_text(text)
+    return bool(re.fullmatch(r"\d{2}[A-Z]{3}\d{2}", text))
+
+
+def _is_bank_statement_summary(html_grid):
+    """
+    The Revolut 'Balance summary' table is structurally different from the
+    transaction table.  Its HTML structure is already the useful source of
+    truth, including the two-line 'Closing balance' header.
+    """
+    if not html_grid:
+        return False
+
+    header = " ".join(
+        clean_text(cell.get("text", ""))
+        for cell in html_grid[0]
+    ).lower()
+
+    normalized = normalize_for_compare(header)
+
+    return (
+        "product" in normalized
+        and "openingbalance" in normalized
+        and "moneyout" in normalized
+        and "moneyin" in normalized
+        and "closingbalance" in normalized
+    )
+
+
+def _find_bank_header_row(ocr_items):
+    """Locate the bank header row anywhere in the OCR result."""
+    rows = cluster_ocr_rows(ocr_items)
+    if not rows:
+        return None, None, rows
+
+    best_idx = None
+    best_score = -1
+    for idx, row in enumerate(rows):
+        toks = [_normalize_header_token(x.get("text", "")) for x in row]
+        score = 0
+        score += 1 if "date" in toks else 0
+        score += 1 if ("details" in toks or "description" in toks) else 0
+        score += 1 if ("withdrawn" in toks or "moneyout" in toks) else 0
+        score += 1 if ("balance" in toks) else 0
+        score += 1 if ("paidin" in toks or ("paid" in toks and "in" in toks) or "moneyin" in toks) else 0
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    if best_idx is not None and best_score >= 3:
+        return best_idx, rows[best_idx], rows
+    return None, None, rows
+
+
+def _numeric_anchor_candidates(ocr_items):
+    return [
+        (float(item["box"][2]), item)
+        for item in ocr_items
+        if _is_standalone_amount(item.get("text", ""))
+    ]
+
+
+def _cluster_amount_columns(amount_x):
+    """Return 2 or 3 robust X clusters for standalone monetary values."""
+    if len(amount_x) < 2:
+        return []
+
+    xs = sorted(float(x) for x in amount_x)
+    c2 = cluster_1d(xs, 2) if len(xs) >= 4 else []
+    c3 = cluster_1d(xs, 3) if len(xs) >= 9 else []
+
+    def quality(clusters):
+        if len(clusters) < 2:
+            return -1.0
+        centers = [c["center"] for c in clusters]
+        gaps = [centers[i+1] - centers[i] for i in range(len(centers)-1)]
+        spreads = []
+        for c in clusters:
+            vals = c["values"]
+            mean = c["center"]
+            if vals:
+                spreads.append(sum((v-mean)**2 for v in vals) / len(vals))
+        spread = (sum(spreads) / len(spreads)) ** 0.5 if spreads else 0.0
+        return min(gaps) / max(1.0, spread)
+
+    # Prefer three clusters only when the middle cluster is genuinely
+    # separated. Otherwise two-cluster geometry is the safer interpretation.
+    q2 = quality(c2)
+    q3 = quality(c3) if len(c3) == 3 else -1.0
+    if len(c3) == 3 and q3 > max(6.0, q2 * 1.15):
+        return [c["center"] for c in c3]
+    if len(c2) == 2:
+        return [c["center"] for c in c2]
+    if len(c3) == 3:
+        return [c["center"] for c in c3]
+    return []
+
+
+def _infer_bank_numeric_anchors(ocr_items):
+    """Infer numeric-column anchors without trusting malformed cell geometry.
+
+    When the OCR header is present, its X centers are the primary source of
+    truth.  This preserves the behavior that was already good on most pages.
+    Only when the header cannot be found do we infer numeric columns from the
+    right edges of repeated standalone money values.
+    """
+    header_idx, header_items, rows = _find_bank_header_row(ocr_items)
+
+    found = {}
+    if header_items:
+        for item in header_items:
+            norm = _normalize_header_token(item.get("text", ""))
+            x = float(item["center"][0])
+            if norm in ("withdrawn", "moneyout"):
+                found["withdrawn"] = x
+            elif norm in ("paidin", "moneyin"):
+                found["paidin"] = x
+            elif norm == "balance":
+                found["balance"] = x
+            elif norm == "date":
+                found["date"] = x
+            elif norm in ("details", "description"):
+                found["details"] = x
+
+        if "paidin" not in found:
+            parts = [
+                x for x in header_items
+                if _normalize_header_token(x.get("text", "")) in ("paid", "in")
+            ]
+            if len(parts) >= 2:
+                found["paidin"] = sum(float(x["center"][0]) for x in parts[:2]) / 2.0
+
+        if all(k in found for k in ("withdrawn", "paidin", "balance")):
+            numeric = [found["withdrawn"], found["paidin"], found["balance"]]
+            if all(a < b for a, b in zip(numeric, numeric[1:])):
+                return [
+                    found.get("date", 0.0),
+                    found.get("details", 0.0),
+                    *numeric,
+                ], rows, header_idx
+
+    # Header missing: infer only the numeric columns from standalone money
+    # boxes. Their right edge is stable despite varying digit counts.
+    amount_x = [x for x, _ in _numeric_anchor_candidates(ocr_items)]
+    observed = _cluster_amount_columns(amount_x)
+    if len(observed) == 3:
+        return [found.get("date", 0.0), found.get("details", 0.0), *observed], rows, header_idx
+
+    if len(observed) == 2:
+        if all(k in found for k in ("paidin", "balance")):
+            numeric = [observed[0], found["paidin"], found["balance"]]
+            if not (numeric[0] < numeric[1] < numeric[2]):
+                numeric = [observed[0], (observed[0] + observed[1]) / 2.0, observed[1]]
+        elif all(k in found for k in ("withdrawn", "balance")):
+            numeric = [found["withdrawn"], (observed[0] + observed[1]) / 2.0, observed[1]]
+            if not (numeric[0] < numeric[1] < numeric[2]):
+                numeric = [observed[0], (observed[0] + observed[1]) / 2.0, observed[1]]
+        else:
+            numeric = [observed[0], (observed[0] + observed[1]) / 2.0, observed[1]]
+        return [found.get("date", 0.0), found.get("details", 0.0), *numeric], rows, header_idx
+
+    return None, rows, header_idx
+
+
+def _extract_embedded_bank_date(text):
+    """Extract a transaction date embedded in an OCR text line.
+
+    Supports both Permanent TSB's compact form (03JUN25) and the
+    human-readable form used by Revolut-style statements (9 May 2025).
+    The date is only extracted when it is the only date-like token in the
+    OCR line; the remainder stays in Details/Description.
+    """
+    text = clean_text(text)
+
+    patterns = (
+        r"(?<!\d)(\d{2}[A-Z]{3}\d{2})(?!\d)",
+        r"(?<!\d)(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})(?!\d)",
+        r"(?<!\d)(\d{1,2}[/-](?:\d{1,2})[/-]\d{2,4})(?!\d)",
+    )
+
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
+        if len(matches) != 1:
+            continue
+        m = matches[0]
+        date_text = clean_text(m.group(1))
+        remainder = clean_text(text[:m.start()] + " " + text[m.end():])
+        return date_text, remainder
+
+    return None, text
+
+
+def _assign_bank_row_semantically(row_items, anchors):
+    """Initial geometric assignment of one bank row.
+
+    The numeric anchors describe the three physical numeric positions from
+    left to right.  A later orientation-consistency pass may reverse the
+    numeric columns (and/or the row order) when the OCR coordinate system
+    for a page is mirrored.
+    """
+    columns = [[] for _ in range(5)]
+    numeric_anchors = anchors[2:5]
+    for item in row_items:
+        text = clean_text(item.get("text", ""))
+        if not text:
+            continue
+        if _is_bank_date(text):
+            columns[0].append(item)
+            continue
+
+        embedded_date, remainder = _extract_embedded_bank_date(text)
+        if embedded_date:
+            date_item = dict(item)
+            date_item["text"] = embedded_date
+            columns[0].append(date_item)
+            if not remainder:
+                continue
+            item = dict(item)
+            item["text"] = remainder
+            text = remainder
+
+        if _is_standalone_amount(text):
+            cx = float(item["box"][2])
+            target = min(range(3), key=lambda i: abs(cx - numeric_anchors[i]))
+            columns[2 + target].append(item)
+        else:
+            columns[1].append(item)
+    for col in columns:
+        col.sort(key=lambda item: (item["center"][1], item["center"][0]))
+    return columns
+
+
+def _clone_bank_columns(columns):
+    return [list(col) for col in columns]
+
+
+def _flip_bank_numeric_columns(rows):
+    """Mirror only Withdrawn/Paid In/Balance, preserving Date/Details."""
+    flipped = []
+    for columns in rows:
+        c = _clone_bank_columns(columns)
+        c[2], c[4] = c[4], c[2]
+        flipped.append(c)
+    return flipped
+
+
+def _bank_amount_value(items):
+    """Return a single numeric amount from a column, else None."""
+    values = [
+        clean_text(item.get("text", ""))
+        for item in items
+        if _is_standalone_amount(item.get("text", ""))
+    ]
+    if len(values) != 1:
+        return None
+    try:
+        return float(values[0].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _bank_date_key(text):
+    """Parse common bank statement date formats to a comparable tuple."""
+    text = clean_text(text)
+    if _is_bank_date(text):
+        try:
+            return (int(text[5:7]) + 2000,
+                    ("JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split().index(text[2:5]) + 1),
+                    int(text[:2]))
+        except (ValueError, IndexError):
+            return None
+
+    m = re.fullmatch(
+        r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        months = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+            "may": 5, "jun": 6, "jul": 7, "aug": 8,
+            "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        return (int(m.group(3)), months[m.group(2)[:3].lower()], int(m.group(1)))
+
+    return None
+
+
+def _bank_orientation_score(rows):
+    """Score chronological balance continuity for a candidate orientation."""
+    if len(rows) < 2:
+        return 0.0, 0
+
+    exact = 0
+    comparisons = 0
+    errors = []
+
+    for previous, current in zip(rows, rows[1:]):
+        prev_balance = _bank_amount_value(previous[4])
+        curr_balance = _bank_amount_value(current[4])
+        if prev_balance is None or curr_balance is None:
+            continue
+
+        withdrawn = _bank_amount_value(current[2]) or 0.0
+        paid_in = _bank_amount_value(current[3]) or 0.0
+        expected = prev_balance - withdrawn + paid_in
+        error = abs(expected - curr_balance)
+        comparisons += 1
+
+        # Bank statements are cents-precise. Allow a small OCR/rounding
+        # tolerance, but reward exact balance continuity very strongly.
+        if error <= 0.051:
+            exact += 1
+            errors.append(0.0)
+        else:
+            errors.append(error)
+
+    if comparisons == 0:
+        return 0.0, 0
+
+    mean_error = sum(errors) / len(errors)
+    score = exact * 100.0 - mean_error
+    return score, comparisons
+
+
+def _orient_bank_rows(rows):
+    """Correct rare per-page mirror/flip errors using statement arithmetic.
+
+    Paddle's OCR coordinates can occasionally be transformed for a page even
+    though the rendered PDF is visually normal.  Rather than hardcoding a
+    page number, test the four plausible orientations:
+      1. normal rows + normal numeric order
+      2. normal rows + mirrored numeric order
+      3. reversed rows + normal numeric order
+      4. reversed rows + mirrored numeric order
+
+    Only apply an alternative when it has several balance-to-transaction
+    comparisons and materially beats the unmodified orientation.
+    """
+    candidates = []
+    base = rows
+
+    variants = (
+        ("normal", base),
+        ("numeric_flip", _flip_bank_numeric_columns(base)),
+        ("row_flip", list(reversed(base))),
+        ("both_flip", list(reversed(_flip_bank_numeric_columns(base)))),
+    )
+
+    for name, candidate in variants:
+        score, comparisons = _bank_orientation_score(candidate)
+        candidates.append((score, comparisons, name, candidate))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_comparisons, best_name, best_rows = candidates[0]
+    normal_score, normal_comparisons, _, _ = candidates[0] if candidates[0][2] == "normal" else next(
+        item for item in candidates if item[2] == "normal"
+    )
+
+    if best_name != "normal" and best_comparisons >= 3:
+        # Require a meaningful improvement, not a single lucky balance match.
+        improvement = best_score - normal_score
+        if improvement >= 150.0 or (best_score >= 250.0 and improvement >= 50.0):
+            print(
+                f"Bank OCR orientation correction: {best_name} "
+                f"({best_comparisons} balance checks)"
+            )
+            return best_rows
+
+    return rows
+
+
+def _bank_header_from_html(html_grid):
+    text = " ".join(clean_text(cell.get("text", "")) for row in (html_grid or []) for cell in row).lower()
+    if "description" in text or "money out" in text or "money in" in text:
+        return ["Date", "Description", "Money out", "Money in", "Balance"]
+    return ["Date", "Details", "Withdrawn", "Paid In", "Balance"]
+
+
+def build_bank_statement_from_ocr(cell_boxes, ocr_items, column_count=5, html_grid=None):
+    if not ocr_items or column_count != 5:
+        return [], 0, len(ocr_items)
+
+    anchors, visual_rows, header_idx = _infer_bank_numeric_anchors(ocr_items)
+    if anchors is None:
+        return [], 0, len(ocr_items)
+
+    print("Bank OCR numeric anchors: " + ", ".join(f"{x:.1f}" for x in anchors[2:5]))
+
+    assigned_rows = []
+    for idx, row_items in enumerate(visual_rows):
+        # Never blindly drop row 0: header can be at the bottom or missing.
+        if header_idx is not None and idx == header_idx:
+            continue
+        columns = _assign_bank_row_semantically(row_items, anchors)
+        assigned_rows.append(columns)
+
+    assigned_rows = _orient_bank_rows(assigned_rows)
+
+    grid = [_bank_header_from_html(html_grid)]
+    for columns in assigned_rows:
+        row = [cell_text(col) for col in columns]
+        if any(row):
+            grid.append(row)
+
+    return grid, len(ocr_items), 0
+
 
 def build_grid_from_ocr(
     cell_boxes,
@@ -376,7 +853,8 @@ def build_grid_from_ocr(
 
     column_centers = detect_column_centers(
         cell_boxes,
-        column_count
+        column_count,
+        ocr_items
     )
 
     if len(column_centers) != column_count:
@@ -1193,6 +1671,62 @@ def map_boxes_to_html_grid(
 
 
 # ============================================================
+# NORMALIZE HTML GRID
+# ============================================================
+
+def trim_structurally_empty_columns(
+    html_grid
+):
+    """
+    Paddle can occasionally emit phantom trailing columns.
+
+    Example:
+        real table = 5 columns
+        Paddle HTML = 6 columns
+        6th column contains no HTML text.
+
+    Keep the HTML structure only as a source of text/header
+    metadata; OCR geometry is used for the actual placement.
+    """
+    if not html_grid:
+        return html_grid
+
+    max_cols = max(
+        len(row)
+        for row in html_grid
+    )
+
+    keep_cols = max_cols
+
+    while keep_cols > 1:
+        has_text = False
+
+        for row in html_grid:
+            if keep_cols - 1 < len(row):
+                if clean_text(
+                    row[keep_cols - 1].get(
+                        "text",
+                        ""
+                    )
+                ):
+                    has_text = True
+                    break
+
+        if has_text:
+            break
+
+        keep_cols -= 1
+
+    if keep_cols == max_cols:
+        return html_grid
+
+    return [
+        list(row[:keep_cols])
+        for row in html_grid
+    ]
+
+
+# ============================================================
 # BUILD FINAL GRID
 # ============================================================
 
@@ -1201,23 +1735,39 @@ def build_final_grid(
     cell_boxes,
     ocr_items
 ):
-
     if not html_grid:
-
         return [], 0, len(ocr_items)
 
     rows = len(html_grid)
-
     cols = max(
         len(row)
         for row in html_grid
     )
 
     # ========================================================
+    # SPECIAL-CASE STRUCTURED SUMMARY TABLES
+    # ========================================================
+    #
+    # sample2.pdf table 2 is a 3-row Revolut balance summary.  OCR sees
+    # "Closing" and "balance" as two visual lines, so a naive row-count
+    # comparison incorrectly decides that Paddle HTML is suspicious and
+    # manufactures a fifth row.
+    #
+    # The HTML structure is exactly the representation we want for this
+    # table, including the two-line "Closing balance" header.
+    if _is_bank_statement_summary(html_grid):
+        grid = [
+            [
+                clean_text(cell.get("text", ""))
+                for cell in row
+            ]
+            for row in html_grid
+        ]
+        return grid, 0, len(ocr_items)
+
+    # ========================================================
     # DETECT WHETHER PADDLE'S HTML STRUCTURE IS SUSPICIOUS
     # ========================================================
-
-    # Estimate how many actual visual rows exist from OCR.
     visual_rows = cluster_ocr_rows(
         ocr_items
     )
@@ -1229,28 +1779,33 @@ def build_final_grid(
     html_is_suspicious = False
 
     if visual_row_count > 0:
-
-        # Example:
-        #
-        # Paddle HTML: 39 rows
-        # OCR visual rows: ~21
-        #
-        # That's clearly bogus.
+        # Paddle often gets the row structure approximately right while
+        # still putting OCR geometry into the wrong cells.
         if rows > visual_row_count * 1.35:
-
             html_is_suspicious = True
 
-    # Also flag extremely large empty HTML grids.
-    if rows >= 30 and len(ocr_items) < rows * 1.5:
+        # Long transaction tables: one OCR visual row generally represents
+        # one printed transaction line.
+        if (
+            rows >= 30
+            and visual_row_count >= rows * 0.75
+        ):
+            html_is_suspicious = True
 
+        if visual_row_count > max(1, rows) * 1.5:
+            html_is_suspicious = True
+
+    # Bank statements always use the semantic OCR reconstruction.
+    if looks_like_bank_statement(html_grid, ocr_items):
+        html_is_suspicious = True
+
+    if rows >= 30 and len(ocr_items) < rows * 1.5:
         html_is_suspicious = True
 
     # ========================================================
     # OCR-DRIVEN FALLBACK
     # ========================================================
-
     if html_is_suspicious:
-
         print(
             "WARNING: Paddle HTML structure appears "
             "over-expanded."
@@ -1261,16 +1816,41 @@ def build_final_grid(
             f"{visual_row_count} visual rows"
         )
 
-        grid, assigned, unmatched = (
-            build_grid_from_ocr(
-                cell_boxes,
-                ocr_items,
-                cols
-            )
+        fallback_cols = cols
+
+        header_text = " ".join(
+            clean_text(cell.get("text", ""))
+            for cell in html_grid[0]
+        ).lower() if html_grid else ""
+
+        bank_markers = (
+            "date",
+            "details",
+            "balance",
         )
 
-        if grid:
+        if all(marker in header_text for marker in bank_markers):
+            fallback_cols = 5
 
+        if looks_like_bank_statement(html_grid, ocr_items):
+            grid, assigned, unmatched = (
+                build_bank_statement_from_ocr(
+                    cell_boxes,
+                    ocr_items,
+                    5,
+                    html_grid=html_grid,
+                )
+            )
+        else:
+            grid, assigned, unmatched = (
+                build_grid_from_ocr(
+                    cell_boxes,
+                    ocr_items,
+                    fallback_cols
+                )
+            )
+
+        if grid:
             return (
                 grid,
                 assigned,
@@ -1280,9 +1860,7 @@ def build_final_grid(
     # ========================================================
     # NORMAL PADDLE HTML PATH
     # ========================================================
-
     if len(cell_boxes) == rows * cols:
-
         box_grid = [
             cell_boxes[
                 r * cols:
@@ -1290,20 +1868,15 @@ def build_final_grid(
             ]
             for r in range(rows)
         ]
-
     else:
-
         box_grid = map_boxes_to_html_grid(
             html_grid,
             cell_boxes
         )
 
     if box_grid is None:
-
         grid = []
-
         for row in html_grid:
-
             grid.append([
                 clean_text(
                     cell.get(
@@ -1324,15 +1897,11 @@ def build_final_grid(
     valid_positions = []
 
     for r in range(rows):
-
         for c in range(cols):
-
             box = box_grid[r][c]
 
             if box is not None:
-
                 valid_boxes.append(box)
-
                 valid_positions.append(
                     (r, c)
                 )
@@ -1360,13 +1929,11 @@ def build_final_grid(
     for i, (r, c) in enumerate(
         valid_positions
     ):
-
         text = cell_text(
             assigned[i]
         )
 
         if text:
-
             grid[r][c] = text
 
     return (
@@ -1374,6 +1941,7 @@ def build_final_grid(
         assigned_count,
         unmatched,
     )
+
 # ============================================================
 # HEADERS
 # ============================================================
@@ -1649,6 +2217,11 @@ def process_table(
         parsed_html
     )
 
+    # Remove phantom trailing columns produced by malformed HTML.
+    html_grid = trim_structurally_empty_columns(
+        html_grid
+    )
+
     html_rows = len(html_grid)
 
     html_cols = (
@@ -1843,7 +2416,6 @@ print("=" * 70)
 pipeline = PPStructureV3(
     use_doc_orientation_classify=False,
     use_doc_unwarping=False,
-    enable_mkldnn=False,
 )
 
 pdfs = sorted(
